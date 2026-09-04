@@ -66,10 +66,11 @@ function safeCurrentSession(ctx) {
  * @returns {null | {ranked: number[], answer?: string}} null = use fallback.
  */
 export async function rankAndAnswer(ctx, opts, candidates, signal) {
-  const llm = ctx?.llm ?? (typeof ctx?.get === "function" ? ctx.get("llm") : undefined);
-  if (!llm?.stream || !opts.llmProvider || !opts.llmModel) return null;
   const d = linkedDeadline(signal, opts.llmTimeoutMs, "WEB_LLM_TIMEOUT");
   try {
+    // defensive: an un-injected/unavailable llm context must fall back, never throw
+    const llm = ctx?.llm ?? (typeof ctx?.get === "function" ? ctx.get("llm") : undefined);
+    if (!llm?.stream || !opts.llmProvider || !opts.llmModel) return null;
     const messages = [
       createUserMessage({
         content: [{ type: "text", text: frame(opts.query, candidates) }],
