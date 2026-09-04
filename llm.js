@@ -3,9 +3,24 @@
 // Strict-JSON contract, fully defensive — any failure returns null and the
 // caller falls back to the deterministic RRF order. Search never blocks on
 // the model. See docs spec §7.
+//
+// Every decision path appends a JSON line to diag.log in the plugin repo —
+// the in-dsh session events are not guaranteed (service binding), so the
+// file is the source of truth for what the step actually did. Diagnostics
+// never affect search: all logging is best-effort.
 
+import { appendFileSync } from "node:fs";
 import { BlockAssembler, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { linkedDeadline } from "./http.js";
+
+const DIAG = new URL("../diag.log", import.meta.url);
+function diag(t, extra) {
+  try {
+    appendFileSync(DIAG, JSON.stringify({ ts: Date.now(), t, ...extra }) + "\n");
+  } catch {
+    /* diagnostics must never break search */
+  }
+}
 
 const SYSTEM = [
   "You are a search-result filter and summarizer.",
@@ -69,8 +84,21 @@ export async function rankAndAnswer(ctx, opts, candidates, signal) {
   const d = linkedDeadline(signal, opts.llmTimeoutMs, "WEB_LLM_TIMEOUT");
   try {
     // defensive: an un-injected/unavailable llm context must fall back, never throw
-    const llm = ctx?.llm ?? (typeof ctx?.get === "function" ? ctx.get("llm") : undefined);
-    if (!llm?.stream || !opts.llmProvider || !opts.llmModel) return null;
+    let llm;
+    try {
+      llm = ctx?.llm ?? (typeof ctx?.get === "function" ? ctx.get("llm") : undefined);
+    } catch (e) {
+      diag("llm-access", { result: "threw", message: String(e?.message ?? e) });
+      return null;
+    }
+    if (!llm?.stream) {
+      diag("llm-access", { result: llm ? "value-without-stream" : "undefined" });
+      return null;
+    }
+    if (!opts.llmProvider || !opts.llmModel) {
+      diag("llm-access", { result: "no-route-in-config" });
+      return null;
+    }
     const messages = [
       createUserMessage({
         content: [{ type: "text", text: frame(opts.query, candidates) }],
@@ -87,6 +115,7 @@ export async function rankAndAnswer(ctx, opts, candidates, signal) {
     } catch {
       /* logging is best-effort */
     }
+    const t0 = Date.now();
     const assembler = new BlockAssembler();
     for await (const chunk of llm.stream({
       provider: opts.llmProvider,
@@ -94,22 +123,39 @@ export async function rankAndAnswer(ctx, opts, candidates, signal) {
       messages,
       system: SYSTEM,
       maxTokens: 1024,
-      purpose: "web-search",
+      // no `purpose`: dsh-llm's union is 'compaction' | 'session-title' and
+      // adapters in this deployment treat it as passthrough; unset is the
+      // documented choice for calls that match neither.
       signal: d.signal,
       ...(session ? { sessionId: session.id } : {}),
     })) {
       d.signal.throwIfAborted();
       assembler.push(chunk);
     }
-    if (assembler.finish?.kind !== "stop") return null;
+    const finish = assembler.finish;
     const text = assembler
       .blocks()
       .filter((b) => b.type === "text")
       .map((b) => b.text)
       .join("")
       .trim();
-    return parseLlmJson(text, candidates.length);
-  } catch {
+    diag("stream-end", {
+      ms: Date.now() - t0,
+      kind: finish?.kind,
+      failure: finish?.failure ? JSON.stringify(finish.failure) : undefined,
+      textLen: text.length,
+      head: text.slice(0, 120),
+    });
+    if (finish?.kind !== "stop") return null;
+    const parsed = parseLlmJson(text, candidates.length);
+    diag("parse", {
+      result: parsed ? "ok" : "null",
+      rankedLen: parsed?.ranked?.length,
+      answerLen: parsed?.answer?.length,
+    });
+    return parsed;
+  } catch (e) {
+    diag("call-error", { message: String(e?.message ?? e) });
     return null;
   } finally {
     d.dispose();

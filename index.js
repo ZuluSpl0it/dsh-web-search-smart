@@ -15,7 +15,7 @@ import { search as bingSearch } from "./engines/bing.js";
 import { search as duckDuckGoSearch } from "./engines/duckduckgo.js";
 
 export const name = "web-search-smart";
-export const inject = ["web", "llm"]; // "llm" needed for the rank/summary step
+export const inject = ["web", "llm", "agents"]; // llm: rank/summary step; agents: session event logging
 
 /** Open registry: adding an engine = implement search(query, cfg, signal) → verdict, add here. */
 export const ENGINES = {
