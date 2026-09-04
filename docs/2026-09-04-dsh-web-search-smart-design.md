@@ -8,13 +8,13 @@
 
 ## 1. Background (all verified against this machine, 2026-09-04)
 
-- The harness `web_search` tool runs through the `ctx.web` seam (`@deepseek-ai/dsh-web` 0.1.2-rc.1). Search providers are pluggable objects: `{id, available(), search({query, maxResults}, signal) → {sources, truncated, answer?}}`, registered by plugin modules exporting `{name, inject: ["web"], Config, apply}`.
+- The harness `web_search` tool runs through the `ctx.web` seam (`@deepseek-ai/dsh-web` 0.1.2-rc.1). Search providers are pluggable objects: `{id, available(), search({query, maxResults}, signal) → {sources, truncated, content?}}`, registered by plugin modules exporting `{name, inject: ["web"], Config, apply}`.
 - The installed community provider `dsh-web-search-local` has three structural flaws, each observed in production use:
   1. **First-engine-wins sequencing.** `runSearch` (index.js:605) loops engines serially and returns the first non-empty set. A degraded engine poisons the whole answer.
   2. **No degradation detection.** Bing serves this machine's IP randomized bot-feed SERPs, verified in three variants of the same query: zh `setlang` → Google homepage domains; en-US → roof heat-tape pages; default → multilingual `support.google.com` flood. All carry the `"Content was generated with AI"` marker. None of these were filtered; all were returned.
   3. **Silent no-op engines.** The config had `engines: [google, bing, duckduckgo, mojeek, baidu]`, but the plugin's `ENGINES` map (index.js:576) implements no `google`, and `engineList()` (index.js:588) silently drops unknown names. The user's `google` entry was a no-op with no error anywhere.
 - Google from this IP: reachable (HTTP 200) but serves a consent/JS shell ("Google Search" title only) to non-browser clients. A browser-grade header set plus consent-cookie retry is required; a `/sorry/` captcha remains possible and must be handled by cooldown, not retry-storms.
-- Nothing in the current setup fills the seam's optional `answer` field (my tool renders it as a summary). Only the official DeepSeek provider does, at the cost of a DeepSeek API turn per search — which this deployment deliberately avoids (model is local qwen 3.8 27B via `http://127.0.0.1:18020/v1`).
+- Nothing in the current setup fills the seam's optional `content` field (the web_search tool renders it as the summary). Only the official DeepSeek provider does, at the cost of a DeepSeek API turn per search — which this deployment deliberately avoids (model is local qwen 3.8 27B via `http://127.0.0.1:18020/v1`).
 - The profile's hoisted `~/.dsh/profiles/node_modules/@deepseek-ai/` contains `schemastery`, `dsh-web`, `dsh-llm`, `dsh-llm-retry`, `dsh-timeout`, `dsh-credentials`, `dsh-launch-environment` — a file-based plugin under `profiles/web/plugins/` can import these through normal Node ESM upward resolution. "Zero npm deps" of the community plugin was a choice, not a constraint.
 
 ## 2. Goals
@@ -36,7 +36,7 @@
 
 ## 4. Provider contract (from `dsh-web/lib/index.js` source)
 
-- `search(request, signal)` receives `request = {query, maxResults?}` and must return `{sources: WebSource[], truncated: boolean, answer?: string}` where `WebSource = {url: string, title?: string, snippet?: string, publishedAt?: string}` (ISO-8601). The seam truncates `sources` to `maxResults` itself and sets `truncated`.
+- `search(request, signal)` receives `request = {query, maxResults?}` and must return `{sources: WebSource[], truncated: boolean, content?: string}` where `WebSource = {url: string, title?: string, snippet?: string, publishedAt?: string}` (ISO-8601). The seam truncates `sources` to `maxResults` itself and sets `truncated`.
 - `available()` → `true` when the provider is configured and at least one engine is not permanently disabled; `false` only for fundamentally broken config (the seam then raises `WEB_PROVIDER_CONFIGURED_UNAVAILABLE`). All-runtime failures (all engines cooling down) are thrown from `search()` as descriptive `WebError`s instead.
 - Errors: `WebError` with machine-routable codes — `WEB_ABORTED` (signal aborted; keep `signal.reason` as cause) and `WEB_PROVIDER_ERROR` otherwise. Failure messages follow the official provider's recovery-hint pattern (name the endpoint, tell the user where to configure it: Settings → Plugins → Plugin configuration).
 - Module shape (mirrors `dsh-web-search-deepseek/lib/index.js`):
@@ -65,8 +65,8 @@ search({query, maxResults}, signal)
  ├─ 4  LLM step (llm.js; if llmRanking and candidates > 0 and llm available):
  │      one ctx.llm.stream turn (provider/model from config, deadline 15 s, maxTokens 1024)
  │      strict-JSON response → {ranked: [i…], answer: "…"}; defensive parse (§7)
- │      success → reorder + drop model-flagged + set `answer`
- │      failure/timeout/non-JSON → deterministic RRF order, no `answer`
+ │      success → reorder + drop model-flagged + set `content`
+ │      failure/timeout/non-JSON → deterministic RRF order, no `content`
  ├─ 5  cap to maxResults (defensive; seam also caps), set truncated
  └─ 6  cache set; session event "web/smart-search" {query, engines: {name: ok|degraded|blocked|error, n},
         llm: used|skipped|failed, ms} via ctx.get("agents")?.currentInitiator()?.session
@@ -107,7 +107,7 @@ Common to all: `GET`, browser-grade header set (`user-agent` = modern desktop Ch
 - Call (pattern of `dsh-session-title-llm`): `createUserMessage({content:[{type:"text",text}], source:{kind:"plugin",plugin:"dsh-web-search-smart"}})` → `ctx.llm.stream({provider, model, system, messages, maxTokens: 1024, purpose: "web-search", sessionId?, signal: deadline(signal, llmTimeoutMs, "WEB_LLM_TIMEOUT").signal})` → `BlockAssembler`.
 - **System prompt:** filter-and-summarize the numbered candidate list (url, title, snippet); respond with exactly one JSON object `{"ranked":[…indices in relevance order…],"answer":"2–4 sentences citing sources as [n]"}`; drop indices that are irrelevant or show bot-feed traits; if none is relevant, `ranked` may be empty and `answer` must say so.
 - **Defensive parse:** extract first `{`…last `}`; validate `ranked` = unique integers in range; `answer` = non-empty string ≤ 500 chars (truncated at 500). Any violation → fallback. Accept finish `stop` only (`max-tokens`/`tool-calls`/`error` → fallback).
-- **Fallback (never blocks search):** deterministic RRF order, no `answer`, event `llm: "failed"`.
+- **Fallback (never blocks search):** deterministic RRF order, no `content`, event `llm: "failed"`.
 
 ## 8. Config (GUI page: Settings → Plugins → *web-search-smart*)
 

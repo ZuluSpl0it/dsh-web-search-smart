@@ -184,7 +184,8 @@ export class SmartSearchProvider {
         ...(s.publishedAt ? { publishedAt: s.publishedAt } : {}),
       })),
       truncated: merged.length > o.maxSources,
-      ...(answer ? { answer } : {}),
+      // seam contract: WebSearchResult.content — dsh-tool-web renders it as the summary
+      ...(answer ? { content: answer } : {}),
     };
     this.#cache.set(cacheKey, result);
     try {
